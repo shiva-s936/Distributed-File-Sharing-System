@@ -358,7 +358,3 @@ The system implements a **Rarest-First** piece selection algorithm:
     ├── client.cpp
     └── tracker_info.txt
 ```
-
-## Author
-
-AOS Assignment 4 - Distributed File Sharing System
