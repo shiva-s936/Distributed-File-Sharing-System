@@ -1,0 +1,21 @@
+# Compiled executables
+tracker/tracker
+client/client
+
+# Log files
+*.txt
+!tracker_info.txt
+
+# Object files
+*.o
+*.obj
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
