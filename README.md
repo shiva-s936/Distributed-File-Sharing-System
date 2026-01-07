@@ -1,6 +1,10 @@
-# Peer-to-Peer Group-Based File Sharing System
+# Distributed File Sharing System
 
-A distributed file sharing system that allows users to share and download files within groups. The system supports parallel downloading from multiple peers, piece-wise file transfer, and SHA1 hash verification for file integrity.
+[![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)](https://www.linux.org/)
+
+A peer-to-peer distributed file sharing system built with C++ that enables users to share and download files within groups. Features parallel downloading from multiple peers, piece-wise file transfer using BitTorrent-like protocols, and SHA1 hash verification for file integrity.
 
 ## Features
 
