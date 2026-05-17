@@ -2,13 +2,20 @@
 tracker/tracker
 client/client
 
-# Log files
-*.txt
-!tracker_info.txt
-
 # Object files
 *.o
 *.obj
+
+# Log files
+trackerlog*.txt
+
+# Tracker persistence state files
+tracker_state*.dat
+tracker_state*.dat.tmp
+
+# Test / temporary files
+*.bin
+*.tmp
 
 # IDE files
 .vscode/

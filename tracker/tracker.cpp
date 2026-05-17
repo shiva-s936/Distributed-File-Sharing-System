@@ -9,7 +9,6 @@
 #include <map>
 #include <set>
 #include <unordered_map>
-#include <unordered_set>
 #include <sstream>
 #include <fstream>
 #include <cstring>
@@ -26,7 +25,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
-#include <pthread.h>
 
 using namespace std;
 
@@ -91,6 +89,166 @@ void log_message(const string& msg) {
     auto time = chrono::system_clock::to_time_t(now);
     log_file << ctime(&time) << msg << endl;
     log_file.close();
+}
+
+/*
+ * Persistence helpers
+ *
+ * Persisted:  users (id + password + group memberships),
+ *             groups (id + owner + members + pending requests + file metadata).
+ * Not persisted: login state, IP/port, active seeders — all rebuilt dynamically
+ *             when clients log back in (the client already re-registers shared
+ *             files on every login).
+ *
+ * Format: one record per line, space-delimited tokens.
+ *   USER       <user_id> <password>
+ *   USER_GROUP <user_id> <group_id>
+ *   GROUP      <group_id> <owner_id>
+ *   GROUP_MEMBER  <group_id> <user_id>
+ *   GROUP_PENDING <group_id> <user_id>
+ *   GROUP_FILE    <group_id> <filename> <filesize> <sha1> <piece_hashes|NONE>
+ *
+ * Written to a temp file then renamed atomically to avoid corruption.
+ */
+
+// Write helper: keeps writing until all bytes are sent
+static bool write_all(int fd, const string& s) {
+    const char* p = s.c_str();
+    size_t rem = s.size();
+    while (rem > 0) {
+        ssize_t n = write(fd, p, rem);
+        if (n < 0) return false;
+        p += n;
+        rem -= n;
+    }
+    return true;
+}
+
+void save_state() {
+    string fname = "tracker_state" + to_string(my_tracker_no) + ".dat";
+    string tmp   = fname + ".tmp";
+
+    // Build the complete state string under each mutex separately
+    string out;
+
+    {
+        lock_guard<mutex> ulock(user_mutex);
+        for (const auto& kv : users) {
+            const User& u = kv.second;
+            out += "USER " + u.user_id + " " + u.password + "\n";
+            for (const auto& g : u.groups)
+                out += "USER_GROUP " + u.user_id + " " + g + "\n";
+        }
+    }
+
+    {
+        lock_guard<mutex> glock(group_mutex);
+        for (const auto& kv : groups) {
+            const Group& g = kv.second;
+            out += "GROUP " + g.group_id + " " + g.owner_id + "\n";
+            for (const auto& m : g.members)
+                out += "GROUP_MEMBER " + g.group_id + " " + m + "\n";
+            for (const auto& p : g.pending_requests)
+                out += "GROUP_PENDING " + g.group_id + " " + p + "\n";
+            for (const auto& fkv : g.files) {
+                const FileInfo& fi = fkv.second;
+                string ph;
+                for (const auto& h : fi.piece_hashes) ph += h;
+                if (ph.empty()) ph = "NONE";
+                out += "GROUP_FILE " + g.group_id + " " + fi.filename + " " +
+                       to_string(fi.filesize) + " " + fi.sha1_hash + " " + ph + "\n";
+            }
+        }
+    }
+
+    // Write to temp file using system calls
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { log_message("save_state: open failed"); return; }
+
+    if (!write_all(fd, out)) {
+        close(fd);
+        unlink(tmp.c_str());
+        log_message("save_state: write failed");
+        return;
+    }
+    close(fd);
+
+    // Atomic replace
+    if (rename(tmp.c_str(), fname.c_str()) < 0) {
+        unlink(tmp.c_str());
+        log_message("save_state: rename failed");
+    }
+}
+
+void load_state() {
+    string fname = "tracker_state" + to_string(my_tracker_no) + ".dat";
+
+    int fd = open(fname.c_str(), O_RDONLY);
+    if (fd < 0) return; // no state file — fresh start
+
+    // Read entire file into a string
+    string content;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0)
+        content.append(buf, n);
+    close(fd);
+
+    // Parse line by line
+    stringstream ss(content);
+    string line;
+    while (getline(ss, line)) {
+        stringstream ls(line);
+        string tag; ls >> tag;
+        if (tag.empty()) continue;
+
+        if (tag == "USER") {
+            string uid, pwd; ls >> uid >> pwd;
+            if (uid.empty() || pwd.empty()) continue;
+            User u;
+            u.user_id = uid; u.password = pwd;
+            u.is_logged_in = false; u.port = 0;
+            users[uid] = u;
+        }
+        else if (tag == "USER_GROUP") {
+            string uid, gid; ls >> uid >> gid;
+            if (users.count(uid)) users[uid].groups.insert(gid);
+        }
+        else if (tag == "GROUP") {
+            string gid, owner; ls >> gid >> owner;
+            if (gid.empty() || owner.empty()) continue;
+            Group g;
+            g.group_id = gid; g.owner_id = owner;
+            groups[gid] = g;
+        }
+        else if (tag == "GROUP_MEMBER") {
+            string gid, uid; ls >> gid >> uid;
+            if (groups.count(gid)) groups[gid].members.insert(uid);
+        }
+        else if (tag == "GROUP_PENDING") {
+            string gid, uid; ls >> gid >> uid;
+            if (groups.count(gid)) groups[gid].pending_requests.insert(uid);
+        }
+        else if (tag == "GROUP_FILE") {
+            string gid, fname2, sha1, ph_str;
+            long long fsz = 0;
+            ls >> gid >> fname2 >> fsz >> sha1 >> ph_str;
+            if (!groups.count(gid) || fname2.empty()) continue;
+            FileInfo fi;
+            fi.filename  = fname2;
+            fi.filesize  = fsz;
+            fi.sha1_hash = sha1;
+            fi.num_pieces = (fsz + PIECE_SIZE - 1) / PIECE_SIZE;
+            if (ph_str != "NONE") {
+                for (size_t i = 0; i + 20 <= ph_str.size(); i += 20)
+                    fi.piece_hashes.push_back(ph_str.substr(i, 20));
+            }
+            groups[gid].files[fname2] = fi;
+        }
+    }
+
+    log_message("State restored from " + fname);
+    cout << "State restored from " << fname << endl;
 }
 
 // Parse tracker info file
@@ -229,10 +387,10 @@ void process_sync(const string& msg) {
             fi.sha1_hash = sha1;
             fi.num_pieces = (filesize + PIECE_SIZE - 1) / PIECE_SIZE;
             
-            // Parse piece hashes
+            // Parse piece hashes — each piece contributes 20 hex chars (spec §File Integrity)
             if (!piece_hashes_str.empty()) {
-                for (size_t i = 0; i < piece_hashes_str.length(); i += 40) {
-                    fi.piece_hashes.push_back(piece_hashes_str.substr(i, 40));
+                for (size_t i = 0; i < piece_hashes_str.length(); i += 20) {
+                    fi.piece_hashes.push_back(piece_hashes_str.substr(i, 20));
                 }
             }
             
@@ -240,44 +398,59 @@ void process_sync(const string& msg) {
             groups[group_id].files[filename] = fi;
         }
     }
+    else if (cmd == "GROUP_REJECT" && tokens.size() >= 3) {
+        lock_guard<mutex> lock(group_mutex);
+        if (groups.find(tokens[1]) != groups.end()) {
+            groups[tokens[1]].pending_requests.erase(tokens[2]);
+        }
+    }
     else if (cmd == "FILE_SEEDER_ADD" && tokens.size() >= 4) {
+        // Session-only: seeder list is rebuilt when clients log back in
         string group_id = tokens[1];
         string filename = tokens[2];
         string user_id = tokens[3];
-        
         lock_guard<mutex> lock(group_mutex);
         if (groups.find(group_id) != groups.end()) {
             if (groups[group_id].files.find(filename) != groups[group_id].files.end()) {
                 groups[group_id].files[filename].seeders.insert(user_id);
             }
         }
+        return; // not persisted
     }
     else if (cmd == "FILE_SEEDER_REMOVE" && tokens.size() >= 4) {
+        // Session-only
         string group_id = tokens[1];
         string filename = tokens[2];
         string user_id = tokens[3];
-        
         lock_guard<mutex> lock(group_mutex);
         if (groups.find(group_id) != groups.end()) {
             if (groups[group_id].files.find(filename) != groups[group_id].files.end()) {
                 groups[group_id].files[filename].seeders.erase(user_id);
             }
         }
+        return; // not persisted
     }
     else if (cmd == "USER_LOGIN" && tokens.size() >= 4) {
+        // Session-only
         lock_guard<mutex> lock(user_mutex);
         if (users.find(tokens[1]) != users.end()) {
             users[tokens[1]].is_logged_in = true;
             users[tokens[1]].ip = tokens[2];
             users[tokens[1]].port = stoi(tokens[3]);
         }
+        return; // not persisted
     }
     else if (cmd == "USER_LOGOUT" && tokens.size() >= 2) {
+        // Session-only
         lock_guard<mutex> lock(user_mutex);
         if (users.find(tokens[1]) != users.end()) {
             users[tokens[1]].is_logged_in = false;
         }
+        return; // not persisted
     }
+
+    // All other sync events change durable state — persist
+    save_state();
 }
 
 // Handle create_user command
@@ -568,6 +741,38 @@ string handle_accept_request(const vector<string>& tokens) {
     return "SUCCESS:Request accepted";
 }
 
+// Handle reject_request command
+string handle_reject_request(const vector<string>& tokens) {
+    if (tokens.size() < 4) {
+        return "ERROR:Invalid command. Usage: reject_request <group_id> <user_id> <owner_id>";
+    }
+
+    string group_id    = tokens[1];
+    string request_user = tokens[2];
+    string owner_id    = tokens[3];
+
+    lock_guard<mutex> lock(group_mutex);
+    if (groups.find(group_id) == groups.end()) {
+        return "ERROR:Group does not exist";
+    }
+
+    if (groups[group_id].owner_id != owner_id) {
+        return "ERROR:Only owner can reject requests";
+    }
+
+    if (!groups[group_id].pending_requests.count(request_user)) {
+        return "ERROR:No pending request from this user";
+    }
+
+    groups[group_id].pending_requests.erase(request_user);
+
+    // Sync with other trackers
+    sync_to_tracker("GROUP_REJECT " + group_id + " " + request_user);
+
+    log_message("Request rejected: " + request_user + " from group " + group_id);
+    return "SUCCESS:Request rejected";
+}
+
 // Handle list_groups command
 string handle_list_groups(const vector<string>& /* tokens */) {
     lock_guard<mutex> lock(group_mutex);
@@ -653,11 +858,11 @@ string handle_upload_file(const vector<string>& tokens) {
     fi.sha1_hash = sha1;
     fi.num_pieces = (filesize + PIECE_SIZE - 1) / PIECE_SIZE;
     
-    // Parse piece hashes
+    // Parse piece hashes — each piece contributes 20 hex chars (spec §File Integrity)
     if (!piece_hashes_str.empty() && piece_hashes_str != "NONE") {
-        for (size_t i = 0; i < piece_hashes_str.length(); i += 40) {
-            if (i + 40 <= piece_hashes_str.length()) {
-                fi.piece_hashes.push_back(piece_hashes_str.substr(i, 40));
+        for (size_t i = 0; i < piece_hashes_str.length(); i += 20) {
+            if (i + 20 <= piece_hashes_str.length()) {
+                fi.piece_hashes.push_back(piece_hashes_str.substr(i, 20));
             }
         }
     }
@@ -796,60 +1001,82 @@ string handle_stop_share(const vector<string>& tokens) {
     return "SUCCESS:Stopped sharing file";
 }
 
+// Commands that modify durable state and must trigger a state save
+static bool is_persistent_command(const string& command) {
+    return command == "create_user"   ||
+           command == "create_group"  ||
+           command == "join_group"    ||
+           command == "leave_group"   ||
+           command == "accept_request"||
+           command == "reject_request"||
+           command == "upload_file";
+}
+
 // Process client command
 string process_command(const string& cmd, const string& client_ip, int client_port) {
     vector<string> tokens = tokenize(cmd);
     if (tokens.empty()) {
         return "ERROR:Empty command";
     }
-    
+
     string command = tokens[0];
-    
+    string response;
+
     if (command == "create_user") {
-        return handle_create_user(tokens);
+        response = handle_create_user(tokens);
     }
     else if (command == "login") {
-        return handle_login(tokens, client_ip, client_port);
+        response = handle_login(tokens, client_ip, client_port);
     }
     else if (command == "logout") {
-        return handle_logout(tokens);
+        response = handle_logout(tokens);
     }
     else if (command == "create_group") {
-        return handle_create_group(tokens);
+        response = handle_create_group(tokens);
     }
     else if (command == "join_group") {
-        return handle_join_group(tokens);
+        response = handle_join_group(tokens);
     }
     else if (command == "leave_group") {
-        return handle_leave_group(tokens);
+        response = handle_leave_group(tokens);
     }
     else if (command == "list_requests") {
-        return handle_list_requests(tokens);
+        response = handle_list_requests(tokens);
     }
     else if (command == "accept_request") {
-        return handle_accept_request(tokens);
+        response = handle_accept_request(tokens);
+    }
+    else if (command == "reject_request") {
+        response = handle_reject_request(tokens);
     }
     else if (command == "list_groups") {
-        return handle_list_groups(tokens);
+        response = handle_list_groups(tokens);
     }
     else if (command == "list_files") {
-        return handle_list_files(tokens);
+        response = handle_list_files(tokens);
     }
     else if (command == "upload_file") {
-        return handle_upload_file(tokens);
+        response = handle_upload_file(tokens);
     }
     else if (command == "get_peers") {
-        return handle_get_peers(tokens);
+        response = handle_get_peers(tokens);
     }
     else if (command == "add_seeder") {
-        return handle_add_seeder(tokens);
+        response = handle_add_seeder(tokens);
     }
     else if (command == "stop_share") {
-        return handle_stop_share(tokens);
+        response = handle_stop_share(tokens);
     }
     else {
         return "ERROR:Unknown command";
     }
+
+    // Persist state after any command that changes durable data
+    if (response.substr(0, 7) == "SUCCESS" && is_persistent_command(command)) {
+        save_state();
+    }
+
+    return response;
 }
 
 // Handle client connection
@@ -964,6 +1191,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    // Restore persisted state before accepting any connections
+    load_state();
+
     cout << "Tracker " << my_tracker_no << " started on " << my_ip << ":" << my_port << endl;
     log_message("Tracker started on " + my_ip + ":" + to_string(my_port));
     

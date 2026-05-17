@@ -7,8 +7,6 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <set>
-#include <unordered_map>
 #include <sstream>
 #include <fstream>
 #include <cstring>
@@ -16,9 +14,6 @@
 #include <thread>
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
-#include <queue>
-#include <random>
 #include <chrono>
 
 #include <sys/socket.h>
@@ -28,9 +23,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
-#include <pthread.h>
 #include <openssl/evp.h>
-#include <dirent.h>
 
 using namespace std;
 
@@ -154,7 +147,8 @@ vector<string> compute_piece_hashes(const string& filepath, long long /* filesiz
     
     while ((bytes_read = read(fd, buffer, PIECE_SIZE)) > 0) {
         string hash = compute_sha1(buffer, bytes_read);
-        hashes.push_back(hash.substr(0, 40)); // Use first 20 bytes (40 hex chars)
+        // Spec: each piece contributes the first 20 hex chars of its SHA1
+        hashes.push_back(hash.substr(0, 20));
     }
     
     close(fd);
@@ -309,7 +303,14 @@ void handle_peer_request(int client_fd) {
             // GET_PIECE group_id filename piece_index
             string group_id = tokens[1];
             string filename = tokens[2];
-            int piece_index = stoi(tokens[3]);
+            int piece_index;
+            try {
+                piece_index = stoi(tokens[3]);
+            } catch (...) {
+                string error = "ERROR:Invalid piece index";
+                send(client_fd, error.c_str(), error.size(), 0);
+                continue;
+            }
             
             string key = group_id + ":" + filename;
             
@@ -502,8 +503,14 @@ bool download_piece_from_peer(const string& ip, int port, const string& group_id
         close(sock);
         return false;
     }
-    
-    int size = stoi(tokens[2]);
+
+    int size;
+    try {
+        size = stoi(tokens[2]);
+    } catch (...) {
+        close(sock);
+        return false;
+    }
     
     // Find where data starts (after "PIECE X SIZE ")
     size_t data_start = header.find(tokens[2]) + tokens[2].size() + 1;
@@ -532,10 +539,10 @@ bool download_piece_from_peer(const string& ip, int port, const string& group_id
         return false;
     }
     
-    // Verify hash
+    // Verify hash — compare first 20 hex chars (spec §File Integrity)
     if (!expected_hash.empty()) {
         string actual_hash = compute_sha1(piece_data.data(), piece_data.size());
-        if (actual_hash.substr(0, 40) != expected_hash.substr(0, 40)) {
+        if (actual_hash.substr(0, 20) != expected_hash.substr(0, 20)) {
             return false;
         }
     }
@@ -672,11 +679,11 @@ void download_file(const string& group_id, const string& filename, const string&
         return;
     }
     
-    // Parse piece hashes
+    // Parse piece hashes — 20 hex chars per piece (spec §File Integrity)
     vector<string> piece_hashes;
-    for (size_t i = 0; i < piece_hashes_concat.length(); i += 40) {
-        if (i + 40 <= piece_hashes_concat.length()) {
-            piece_hashes.push_back(piece_hashes_concat.substr(i, 40));
+    for (size_t i = 0; i < piece_hashes_concat.length(); i += 20) {
+        if (i + 20 <= piece_hashes_concat.length()) {
+            piece_hashes.push_back(piece_hashes_concat.substr(i, 20));
         }
     }
     
@@ -1020,6 +1027,28 @@ void cmd_accept_request(const vector<string>& tokens) {
     }
 }
 
+// Handle reject_request
+void cmd_reject_request(const vector<string>& tokens) {
+    if (!is_logged_in) {
+        cout << "Please login first" << endl;
+        return;
+    }
+
+    if (tokens.size() < 3) {
+        cout << "Usage: reject_request <group_id> <user_id>" << endl;
+        return;
+    }
+
+    string cmd = "reject_request " + tokens[1] + " " + tokens[2] + " " + current_user;
+    string response = send_to_tracker(cmd);
+
+    if (response.substr(0, 7) == "SUCCESS") {
+        cout << "Request rejected" << endl;
+    } else {
+        cout << response.substr(6) << endl;
+    }
+}
+
 // Handle list_groups
 void cmd_list_groups() {
     string cmd = "list_groups";
@@ -1288,6 +1317,9 @@ int main(int argc, char* argv[]) {
         else if (cmd == "accept_request") {
             cmd_accept_request(tokens);
         }
+        else if (cmd == "reject_request") {
+            cmd_reject_request(tokens);
+        }
         else if (cmd == "list_groups") {
             cmd_list_groups();
         }
@@ -1324,6 +1356,7 @@ int main(int argc, char* argv[]) {
             cout << "  leave_group <group_id>" << endl;
             cout << "  list_requests <group_id>" << endl;
             cout << "  accept_request <group_id> <user_id>" << endl;
+            cout << "  reject_request <group_id> <user_id>" << endl;
             cout << "  list_groups" << endl;
             cout << "  list_files <group_id>" << endl;
             cout << "  upload_file <file_path> <group_id>" << endl;
