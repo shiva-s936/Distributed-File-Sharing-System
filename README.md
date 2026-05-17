@@ -30,38 +30,40 @@ A peer-to-peer distributed file sharing system built with C++ that enables users
 
 ## Architecture
 
-```text
-  ┌──────────────────────────────────────────────────┐
-  │                  Tracker Layer                    │
-  │                                                   │
-  │   ┌─────────────┐  SYNC   ┌─────────────┐        │
-  │   │  Tracker 1  │◄───────►│  Tracker 2  │        │
-  │   │  port 5000  │         │  port 5001  │        │
-  │   └─────────────┘         └─────────────┘        │
-  └────────────┬──────────────────────┬──────────────┘
-               │  metadata (TCP)      │  metadata (TCP)
-               │  client initiates    │  client initiates
-  ┌────────────▼──────────────────────▼──────────────┐
-  │                  Client / Peer Layer              │
-  │                                                   │
-  │   ┌──────────┐   pieces    ┌──────────┐          │
-  │   │  Peer A  │◄───────────►│  Peer B  │          │
-  │   │ port 6001│    (TCP)    │ port 6002│          │
-  │   └──────────┘             └──────────┘          │
-  │         ▲                       ▲                 │
-  │         │   pieces (TCP)        │                 │
-  │         ▼                       ▼                 │
-  │   ┌──────────┐             ┌──────────┐          │
-  │   │  Peer C  │◄───────────►│  Peer D  │          │
-  │   │ port 6003│             │ port 6004│          │
-  │   └──────────┘             └──────────┘          │
-  └──────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph TL["🗄️ Tracker Layer"]
+        T1["Tracker 1<br/>port 5000"]
+        T2["Tracker 2<br/>port 5001"]
+        T1 <-->|"SYNC<br/>(state replication)"| T2
+    end
+
+    subgraph PL["💻 Client / Peer Layer"]
+        PA["Peer A<br/>port 6001"]
+        PB["Peer B<br/>port 6002"]
+        PC["Peer C<br/>port 6003"]
+        PA <-->|"file pieces (TCP)"| PB
+        PA <-->|"file pieces (TCP)"| PC
+        PB <-->|"file pieces (TCP)"| PC
+    end
+
+    PA -->|"metadata<br/>(client initiates)"| T1
+    PB -->|"metadata<br/>(client initiates)"| T1
+    PC -->|"metadata<br/>(client initiates)"| T2
+    PA -.->|"fallback"| T2
+    PB -.->|"fallback"| T2
+
+    style T1 fill:#4A90D9,color:#fff,stroke:#2c5f8a
+    style T2 fill:#4A90D9,color:#fff,stroke:#2c5f8a
+    style PA fill:#27AE60,color:#fff,stroke:#1a7a42
+    style PB fill:#27AE60,color:#fff,stroke:#1a7a42
+    style PC fill:#27AE60,color:#fff,stroke:#1a7a42
 ```
 
 **Communication flows:**
 
-- **Client → Tracker**: clients always initiate — login, upload metadata, request peer lists
-- **Tracker ↔ Tracker**: bidirectional SYNC messages keep both trackers in sync after every state change
+- **Client → Tracker** (solid): clients always initiate — login, upload metadata, request peer lists; falls back to the other tracker if the primary is down (dashed)
+- **Tracker ↔ Tracker**: bidirectional SYNC messages replicate every state change so both trackers stay consistent
 - **Peer ↔ Peer**: direct TCP connections for piece transfer; any peer can connect to any other peer — not a fixed chain
 
 Trackers hold all metadata (users, groups, file info, seeder lists). Actual file data is transferred directly between client peers over TCP; the tracker is never in the data path.
